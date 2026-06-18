@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-bose-csp"
+version = "0.1.0"
+description = "Async Python library for controlling Bose CSP audio devices over TCP."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    { name = "BWilky" },
+]
+keywords = ["bose", "csp", "audio", "asyncio", "iot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Home Automation",
+    "Framework :: AsyncIO",
+]
+
+[project.urls]
+Homepage = "https://github.com/BWilky/py-bose-csp"
+Repository = "https://github.com/BWilky/py-bose-csp"
+
+[tool.setuptools.packages.find]
+where = ["src"]
