@@ -71,6 +71,15 @@ class BoseCSPDevice:
         self._query_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
 
+        # Strong references to fire-and-forget tasks (e.g. ignore-flag
+        # timers) so they are not garbage-collected before completion.
+        self._background_tasks: set[asyncio.Task] = set()
+
+        # Consecutive failed reconnect attempts, used for exponential
+        # backoff so a device that keeps dropping us (it only allows one
+        # control session) is not hammered into a lockup.
+        self._reconnect_attempts: int = 0
+
         # Data update callbacks (per-zone)
         self._update_callbacks: list[Callable[[str], None]] = []
 
@@ -82,11 +91,18 @@ class BoseCSPDevice:
         self._ignore_mute_update: dict[str, bool] = {}
         self._ignore_source_update: dict[str, bool] = {}
 
-        # Pre-compile regex patterns for response parsing
-        self._gain_re: re.Pattern[str] = re.compile(r'GA"(.+?) Gain">1=(.*)')
-        self._mute_re: re.Pattern[str] = re.compile(r'GA"(.+?) Gain">2=(.*)')
+        # Pre-compile regex patterns for response parsing.
+        # The device echoes responses with optional whitespace, e.g.
+        # 'GA "Zone Gain">1 =-42.0' (space after GA, space around '='),
+        # so the patterns tolerate optional whitespace at each separator.
+        self._gain_re: re.Pattern[str] = re.compile(
+            r'GA\s*"(.+?) Gain"\s*>1\s*=\s*(.*)'
+        )
+        self._mute_re: re.Pattern[str] = re.compile(
+            r'GA\s*"(.+?) Gain"\s*>2\s*=\s*(.*)'
+        )
         self._source_re: re.Pattern[str] = re.compile(
-            r'GA"(.+?) Selector">1=(.*)'
+            r'GA\s*"(.+?) Selector"\s*>1\s*=\s*(.*)'
         )
 
     # ------------------------------------------------------------------ #
@@ -189,6 +205,7 @@ class BoseCSPDevice:
             _LOGGER.info(
                 "Successfully connected to %s:%s.", self.host, self.port
             )
+            self._reconnect_attempts = 0
             self._notify_availability(True)
             await self.query_all_zones_state()
 
@@ -258,10 +275,13 @@ class BoseCSPDevice:
         if not self._running:
             return
 
-        _LOGGER.info(
-            "Waiting %ss before reconnecting...", self._reconnect_delay
-        )
-        await asyncio.sleep(self._reconnect_delay)
+        # Exponential backoff capped at 60s. Without this, a device that
+        # immediately closes each new connection would be reconnected to
+        # every ``reconnect_delay`` seconds forever.
+        self._reconnect_attempts += 1
+        delay = min(self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)), 60)
+        _LOGGER.info("Waiting %ss before reconnecting...", delay)
+        await asyncio.sleep(delay)
 
         if self._running:
             try:
@@ -345,6 +365,9 @@ class BoseCSPDevice:
                 return
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error("Error in periodic query: %s", err)
+                # Back off before retrying so an unexpected error cannot
+                # turn the poll loop into a tight CPU/command busy-loop.
+                await asyncio.sleep(self._volume_interval)
 
     # ------------------------------------------------------------------ #
     #  Response parsing
@@ -371,7 +394,7 @@ class BoseCSPDevice:
                     )
                     return
                 if area in self._state:
-                    new_vol = float(value)
+                    new_vol = float(value.strip())
                     if self._state[area].volume != new_vol:
                         self._state[area].volume = new_vol
                         updated_zone = area
@@ -384,7 +407,7 @@ class BoseCSPDevice:
                     )
                     return
                 if area in self._state:
-                    new_mute = value == "O"
+                    new_mute = value.strip() == "O"
                     if self._state[area].is_muted != new_mute:
                         self._state[area].is_muted = new_mute
                         updated_zone = area
@@ -397,7 +420,7 @@ class BoseCSPDevice:
                     )
                     return
                 if area in self._state:
-                    new_source = int(value)
+                    new_source = int(value.strip())
                     if self._state[area].current_source != new_source:
                         self._state[area].current_source = new_source
                         updated_zone = area
@@ -459,6 +482,20 @@ class BoseCSPDevice:
         flag_dict[key] = False
         _LOGGER.debug("Cleared ignore flag for %s", key)
 
+    def _spawn_ignore_flag(
+        self, flag_dict: dict[str, bool], key: str, delay: float
+    ) -> None:
+        """Spawn a tracked ignore-flag timer task.
+
+        The task is kept in ``_background_tasks`` until it finishes so it is
+        not garbage-collected mid-flight (a known asyncio foot-gun).
+        """
+        task = asyncio.create_task(
+            self._set_ignore_flag(flag_dict, key, delay)
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     # ------------------------------------------------------------------ #
     #  Public control methods
     # ------------------------------------------------------------------ #
@@ -475,15 +512,13 @@ class BoseCSPDevice:
             return
 
         # Set ignore flag
-        asyncio.create_task(
-            self._set_ignore_flag(self._ignore_volume_update, zone_name, 2.0)
-        )
+        self._spawn_ignore_flag(self._ignore_volume_update, zone_name, 2.0)
 
         # Optimistic update (before await to be synchronous)
         self._state[zone_name].volume = volume_db
         self._fire_update_callback(zone_name)
 
-        cmd = 'SA"%s Gain">1=%.1f' % (zone_name, volume_db)
+        cmd = 'SA "%s Gain">1=%.1f' % (zone_name, volume_db)
         await self._send_command(cmd)
 
     async def set_mute(self, zone_name: str, mute_on: bool) -> None:
@@ -498,16 +533,14 @@ class BoseCSPDevice:
             return
 
         # Set ignore flag
-        asyncio.create_task(
-            self._set_ignore_flag(self._ignore_mute_update, zone_name, 2.0)
-        )
+        self._spawn_ignore_flag(self._ignore_mute_update, zone_name, 2.0)
 
         # Optimistic update (before await to be synchronous)
         self._state[zone_name].is_muted = mute_on
         self._fire_update_callback(zone_name)
 
         state_char = "O" if mute_on else "F"
-        cmd = 'SA"%s Gain">2=%s' % (zone_name, state_char)
+        cmd = 'SA "%s Gain">2=%s' % (zone_name, state_char)
         await self._send_command(cmd)
 
     async def set_source(self, zone_name: str, source_index: int) -> None:
@@ -522,15 +555,13 @@ class BoseCSPDevice:
             return
 
         # Set ignore flag
-        asyncio.create_task(
-            self._set_ignore_flag(self._ignore_source_update, zone_name, 2.0)
-        )
+        self._spawn_ignore_flag(self._ignore_source_update, zone_name, 2.0)
 
         # Optimistic update (before await to be synchronous)
         self._state[zone_name].current_source = source_index
         self._fire_update_callback(zone_name)
 
-        cmd = 'SA"%s Selector">1=%s' % (zone_name, source_index)
+        cmd = 'SA "%s Selector">1=%s' % (zone_name, source_index)
         await self._send_command(cmd)
 
     # ------------------------------------------------------------------ #
@@ -539,17 +570,17 @@ class BoseCSPDevice:
 
     async def query_volume(self, zone_name: str) -> None:
         """Query the current volume for a zone."""
-        cmd = 'GA"%s Gain">1' % zone_name
+        cmd = 'GA "%s Gain">1' % zone_name
         await self._send_command(cmd)
 
     async def query_mute(self, zone_name: str) -> None:
         """Query the current mute state for a zone."""
-        cmd = 'GA"%s Gain">2' % zone_name
+        cmd = 'GA "%s Gain">2' % zone_name
         await self._send_command(cmd)
 
     async def query_source(self, zone_name: str) -> None:
         """Query the current source selection for a zone."""
-        cmd = 'GA"%s Selector">1' % zone_name
+        cmd = 'GA "%s Selector">1' % zone_name
         await self._send_command(cmd)
 
     async def query_all_zones_state(self) -> None:
