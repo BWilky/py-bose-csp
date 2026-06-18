@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py-bose-csp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async Python library for controlling Bose CSP audio devices over TCP."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
+dependencies = [
+    "websockets>=12.0",
+]
 authors = [
     { name = "BWilky" },
 ]
