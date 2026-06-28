@@ -3,12 +3,18 @@ Async client for controlling Bose CSP audio devices over TCP.
 
 This module provides the BoseCSPDevice class which manages a persistent TCP
 connection to a Bose Commercial Sound Processor, handles automatic reconnection,
-periodic state polling, optimistic updates, and push-based state change
-notifications.
+periodic state polling, and optimistic updates.
+
+The Bose CSP Serial Control Protocol (SoIP, port 10055) is request/response
+only: the device sends no unsolicited events. State changes made elsewhere
+(e.g. a physical CC zone controller) are picked up by polling with ``GA``
+queries; the subscriber callbacks fire as those poll responses are parsed
+asynchronously, not from any device-initiated push.
 """
 
 import asyncio
 import copy
+import errno
 import logging
 import re
 import socket
@@ -52,6 +58,10 @@ class BoseCSPDevice:
         self.port: int = port
         self._zones: list[str] = list(zones)
         self._reconnect_delay: int = reconnect_delay
+        # Cap on the exponential reconnect backoff. Kept modest so that once the
+        # device frees the SoIP port (e.g. the web dashboard is closed) the
+        # integration recovers within one backoff window rather than minutes.
+        self._reconnect_backoff_max: int = 30
         self._volume_interval: int = volume_interval
         self._other_interval: int = other_interval
 
@@ -64,19 +74,22 @@ class BoseCSPDevice:
         self._writer: asyncio.StreamWriter | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
         # Serializes connect() so two callers (e.g. a lingering internal
-        # reconnect racing a reload/setup-retry) can never open two TCP
-        # sockets to the single-session device at once.
+        # reconnect racing a reload/setup-retry) can never open two overlapping
+        # TCP sockets at once. SoIP/10055 itself supports concurrent control
+        # sessions (per the Bose CSP Serial Control Protocol Guide), but two
+        # sockets from *this* client would fight over the same reader/writer.
         self._connect_lock: asyncio.Lock = asyncio.Lock()
 
         # Publicly readable connection status
         self.is_connected: bool = False
 
-        # Set when the device sends its first byte after a (re)connect. The CSP
-        # only allows one control session and will accept the TCP socket even
-        # when that session is held elsewhere (the web dashboard or the
-        # discovery WebSocket), in which case it never answers. connect() waits
-        # on this so a held/dead session surfaces as a failure rather than a
-        # device stuck at default 0 dB / no source.
+        # Set when the device sends its first byte after a (re)connect. SoIP
+        # control (port 10055) coexists with the ControlSpace Remote app and
+        # CC-1D/2D/3D zone controllers, but the device's browser configuration
+        # dashboard holds an *exclusive* session: while it is open the CSP may
+        # accept the TCP socket and then never answer (or refuse it outright).
+        # connect() waits on this so a dead/held session surfaces as a failure
+        # rather than a device stuck at default 0 dB / no source.
         self._alive_event: asyncio.Event = asyncio.Event()
         # Max seconds connect() waits for that first response before failing.
         self._connect_verify_timeout: float = 10.0
@@ -91,8 +104,9 @@ class BoseCSPDevice:
         self._background_tasks: set[asyncio.Task] = set()
 
         # Consecutive failed reconnect attempts, used for exponential
-        # backoff so a device that keeps dropping us (it only allows one
-        # control session) is not hammered into a lockup.
+        # backoff so a device that keeps dropping/refusing us (e.g. its web
+        # configuration dashboard is open and holds an exclusive session) is
+        # not hammered into a lockup.
         self._reconnect_attempts: int = 0
 
         # Data update callbacks (per-zone)
@@ -277,8 +291,8 @@ class BoseCSPDevice:
             )
             # Bootstrap the state. Availability is set by _mark_session_alive()
             # when the first byte arrives, NOT on TCP-open, because the CSP may
-            # accept the socket while its single control session is held
-            # elsewhere and then never answer.
+            # accept the socket while its web configuration dashboard holds an
+            # exclusive session and then never answer.
             await self.query_all_zones_state()
 
             # Require a real response so a held/dead session surfaces as a
@@ -293,12 +307,32 @@ class BoseCSPDevice:
             )
 
         except (OSError, asyncio.TimeoutError) as err:
-            _LOGGER.error(
-                "Failed to establish a control session with %s:%s: %s",
-                self.host,
-                self.port,
-                err,
-            )
+            # Distinguish the common, actionable causes so the log explains why
+            # the zones went unavailable rather than just "connect failed".
+            if isinstance(err, asyncio.TimeoutError):
+                # TCP opened (or open timed out) but no SoIP response arrived.
+                _LOGGER.warning(
+                    "Connected to %s:%s but the device sent no response; "
+                    "another exclusive session (the CSP web configuration "
+                    "dashboard) may be active. Retrying.",
+                    self.host,
+                    self.port,
+                )
+            elif getattr(err, "errno", None) == errno.ECONNREFUSED:
+                _LOGGER.warning(
+                    "Connection refused on %s:%s - the CSP web configuration "
+                    "dashboard is likely open and holding an exclusive session. "
+                    "Close it and the integration will reconnect automatically.",
+                    self.host,
+                    self.port,
+                )
+            else:
+                _LOGGER.error(
+                    "Failed to establish a control session with %s:%s: %s",
+                    self.host,
+                    self.port,
+                    err,
+                )
             self._notify_availability(False)
             # Tear down the half-started connection so the orphaned listener
             # can't independently schedule a reconnect. The caller decides what
@@ -388,26 +422,41 @@ class BoseCSPDevice:
             )
 
     async def _handle_reconnect(self) -> None:
-        """Wait for the configured delay and then attempt to reconnect."""
-        if not self._running:
-            return
+        """Retry connecting (with backoff) until reconnected or stopped.
 
-        # Exponential backoff capped at 60s. Without this, a device that
-        # immediately closes each new connection would be reconnected to
-        # every ``reconnect_delay`` seconds forever.
-        self._reconnect_attempts += 1
-        delay = min(self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)), 60)
-        _LOGGER.info("Waiting %ss before reconnecting...", delay)
-        await asyncio.sleep(delay)
+        This is a self-contained loop rather than a one-shot attempt that
+        re-arms via ``_start_reconnect()``. Re-arming that way is broken: while
+        this coroutine runs it *is* ``self._reconnect_task``, so the
+        ``_reconnect_task.done()`` guard in ``_start_reconnect()`` would refuse
+        to schedule the next attempt and the retry chain would die after a
+        single failure (e.g. the CSP web dashboard holding the session). Looping
+        here keeps retrying so the integration recovers on its own once the
+        device frees the SoIP port.
+        """
+        while self._running and not self.is_connected:
+            # Exponential backoff capped at ``_reconnect_backoff_max``. Without
+            # the cap, a device that keeps refusing connections (e.g. its web
+            # dashboard is open) would back off unboundedly.
+            self._reconnect_attempts += 1
+            delay = min(
+                self._reconnect_delay * (2 ** (self._reconnect_attempts - 1)),
+                self._reconnect_backoff_max,
+            )
+            _LOGGER.info("Waiting %ss before reconnecting...", delay)
+            await asyncio.sleep(delay)
 
-        if self._running:
+            if not self._running:
+                return
+
             try:
                 await self.connect()
+                return  # Success; _mark_session_alive() reset the backoff.
             except asyncio.CancelledError:
-                return  # Shutdown in progress, don't retry
+                return  # Shutdown in progress, don't retry.
             except Exception:  # noqa: BLE001
-                # Catch everything so the reconnect loop never dies
-                self._start_reconnect()
+                # Swallow and loop so the retry never dies; the next pass waits
+                # a longer backoff and tries again.
+                continue
 
     # ------------------------------------------------------------------ #
     #  TCP listener

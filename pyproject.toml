@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py-bose-csp"
-version = "0.3.1"
+version = "0.3.2"
 description = "Async Python library for controlling Bose CSP audio devices over TCP."
 readme = "README.md"
 license = "MIT"
@@ -26,9 +26,19 @@ classifiers = [
     "Framework :: AsyncIO",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
 [project.urls]
 Homepage = "https://github.com/BWilky/py-bose-csp"
 Repository = "https://github.com/BWilky/py-bose-csp"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
