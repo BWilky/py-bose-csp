@@ -11,6 +11,7 @@ import asyncio
 import copy
 import logging
 import re
+import socket
 from collections.abc import Callable
 
 from .exceptions import BoseCSPConnectionError
@@ -62,9 +63,23 @@ class BoseCSPDevice:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._lock: asyncio.Lock = asyncio.Lock()
+        # Serializes connect() so two callers (e.g. a lingering internal
+        # reconnect racing a reload/setup-retry) can never open two TCP
+        # sockets to the single-session device at once.
+        self._connect_lock: asyncio.Lock = asyncio.Lock()
 
         # Publicly readable connection status
         self.is_connected: bool = False
+
+        # Set when the device sends its first byte after a (re)connect. The CSP
+        # only allows one control session and will accept the TCP socket even
+        # when that session is held elsewhere (the web dashboard or the
+        # discovery WebSocket), in which case it never answers. connect() waits
+        # on this so a held/dead session surfaces as a failure rather than a
+        # device stuck at default 0 dB / no source.
+        self._alive_event: asyncio.Event = asyncio.Event()
+        # Max seconds connect() waits for that first response before failing.
+        self._connect_verify_timeout: float = 10.0
 
         self._running: bool = False
         self._listener_task: asyncio.Task | None = None
@@ -176,16 +191,66 @@ class BoseCSPDevice:
         for callback in self._availability_callbacks:
             callback(is_available)
 
+    def _mark_session_alive(self) -> None:
+        """Record proof that the control session is live.
+
+        Called whenever bytes are received from the device. Any byte means the
+        CSP attached this TCP socket to its control session, so we reset the
+        reconnect backoff, unblock connect()'s liveness check, and mark the
+        device available.
+        """
+        self._reconnect_attempts = 0
+        self._alive_event.set()
+        self._notify_availability(True)
+
+    def _enable_keepalive(self) -> None:
+        """Enable TCP keepalive so the OS detects a silently dropped peer.
+
+        The CSP can drop a session without sending FIN/RST; without keepalive
+        a blocked read() would never notice. Best-effort: any unsupported
+        option is ignored so it can never break connect().
+        """
+        if self._writer is None:
+            return
+        sock = self._writer.get_extra_info("socket")
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Per-option tuning where the platform exposes it (Linux names;
+            # macOS uses TCP_KEEPALIVE for the idle time).
+            idle_opt = getattr(socket, "TCP_KEEPIDLE", None) or getattr(
+                socket, "TCP_KEEPALIVE", None
+            )
+            if idle_opt is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, idle_opt, 20)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except OSError as err:  # noqa: BLE001
+            _LOGGER.debug("Could not set TCP keepalive options: %s", err)
+
     async def connect(self) -> None:
         """Connect to the device and start listener/query tasks.
+
+        Serialized via ``_connect_lock`` so two concurrent callers can never
+        open two TCP sockets to the single-session device at once.
 
         Raises:
             BoseCSPConnectionError: If the connection cannot be established.
         """
-        if self.is_connected:
-            _LOGGER.warning("Already connected.")
-            return
+        async with self._connect_lock:
+            if self.is_connected:
+                _LOGGER.warning("Already connected.")
+                return
+            await self._do_connect()
 
+    async def _do_connect(self) -> None:
+        """Open the socket and start the listener/query tasks.
+
+        The caller must hold ``_connect_lock``.
+        """
         # Clean up any stale tasks/socket from a previous connection
         # before creating new ones (prevents zombie task accumulation
         # across reconnects).
@@ -197,23 +262,53 @@ class BoseCSPDevice:
             self._reader, self._writer = await asyncio.wait_for(
                 connect_coro, timeout=5
             )
+            self._enable_keepalive()
             self._running = True
+            self._alive_event.clear()
 
             self._listener_task = asyncio.create_task(self._listen())
             self._query_task = asyncio.create_task(self._periodic_query())
 
             _LOGGER.info(
-                "Successfully connected to %s:%s.", self.host, self.port
+                "TCP connection to %s:%s established; verifying control "
+                "session.",
+                self.host,
+                self.port,
             )
-            self._reconnect_attempts = 0
-            self._notify_availability(True)
+            # Bootstrap the state. Availability is set by _mark_session_alive()
+            # when the first byte arrives, NOT on TCP-open, because the CSP may
+            # accept the socket while its single control session is held
+            # elsewhere and then never answer.
             await self.query_all_zones_state()
 
+            # Require a real response so a held/dead session surfaces as a
+            # connect failure (handed to reconnect/backoff, or surfaced to the
+            # config flow) instead of a device stuck at default 0 dB / no
+            # source.
+            await asyncio.wait_for(
+                self._alive_event.wait(), timeout=self._connect_verify_timeout
+            )
+            _LOGGER.info(
+                "Control session with %s:%s is live.", self.host, self.port
+            )
+
         except (OSError, asyncio.TimeoutError) as err:
-            _LOGGER.error("Connection failed: %s", err)
+            _LOGGER.error(
+                "Failed to establish a control session with %s:%s: %s",
+                self.host,
+                self.port,
+                err,
+            )
             self._notify_availability(False)
+            # Tear down the half-started connection so the orphaned listener
+            # can't independently schedule a reconnect. The caller decides what
+            # happens next: _handle_reconnect reschedules with backoff, while
+            # the config flow / coordinator surfaces the failure to HA, which
+            # owns the retry. Either way there is exactly one retry path.
+            await self._cleanup_connection()
             raise BoseCSPConnectionError(
-                "Failed to connect to %s:%s" % (self.host, self.port)
+                "Failed to establish a control session with %s:%s"
+                % (self.host, self.port)
             ) from err
 
     async def disconnect(self) -> None:
@@ -222,10 +317,22 @@ class BoseCSPDevice:
         self._running = False
         self._notify_availability(False)
 
-        # Cancel reconnect task first to prevent it from re-triggering
+        # Cancel the reconnect task first and WAIT for it to unwind, so an
+        # in-flight connect() can't leak a half-open socket (one that hasn't
+        # been stored in self._writer yet) and keep the device's single
+        # session reserved. Safe: disconnect() is only called from HA unload,
+        # never from inside the reconnect task, so this cannot deadlock.
         if self._reconnect_task:
             self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
             self._reconnect_task = None
+
+        # Cancel any pending optimistic ignore-flag timers.
+        for task in list(self._background_tasks):
+            task.cancel()
 
         await self._cleanup_connection()
         _LOGGER.info("Disconnected.")
@@ -236,9 +343,19 @@ class BoseCSPDevice:
         Safe to call multiple times. Used by both disconnect() and
         connect() (to clean up stale state before reconnecting).
         """
-        for task in [self._listener_task, self._query_task]:
-            if task and not task.done():
-                task.cancel()
+        tasks = [
+            task
+            for task in (self._listener_task, self._query_task)
+            if task and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        # Await cancellation so old reads/drains finish before the writer is
+        # closed and a new session opens (overlapping I/O on a single-session
+        # device wedges it). Safe: cleanup is only ever called from connect()/
+        # disconnect(), never from inside these tasks.
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._listener_task = None
         self._query_task = None
 
@@ -299,24 +416,45 @@ class BoseCSPDevice:
     async def _listen(self) -> None:
         """Listen for incoming data and parse responses."""
         buffer = ""
+        # The poll loop queries the device at least every ``volume_interval``
+        # seconds, so a silence well beyond that means the session died without
+        # sending FIN/RST (a known CSP behaviour). Reconnect instead of
+        # blocking forever on read().
+        read_timeout = max(self._volume_interval, self._other_interval) * 2 + 10
         while self._running and self._reader:
             try:
-                data = await self._reader.read(1024)
+                data = await asyncio.wait_for(
+                    self._reader.read(1024), timeout=read_timeout
+                )
                 if not data:
                     _LOGGER.warning("Connection closed by remote end.")
                     self._start_reconnect()
                     return
+
+                # Any bytes prove the control session is live.
+                self._mark_session_alive()
 
                 buffer += data.decode("utf-8")
                 while "\r" in buffer:
                     line, buffer = buffer.split("\r", 1)
                     self._parse_response(line)
 
+            except asyncio.CancelledError:
+                return
+            except asyncio.TimeoutError:
+                # Must precede the OSError handler: on Python 3.11+
+                # asyncio.TimeoutError is a subclass of OSError.
+                _LOGGER.warning(
+                    "No data from %s for %ss; control session presumed dead, "
+                    "reconnecting.",
+                    self.host,
+                    read_timeout,
+                )
+                self._start_reconnect()
+                return
             except (OSError, ConnectionResetError) as err:
                 _LOGGER.error("Connection error in listener: %s", err)
                 self._start_reconnect()
-                return
-            except asyncio.CancelledError:
                 return
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error("Unexpected error in listener: %s", err)
@@ -429,9 +567,8 @@ class BoseCSPDevice:
             _LOGGER.error("Error parsing response '%s': %s", response, err)
 
         if updated_zone:
-            # If we successfully parsed data, we must be connected
-            self._notify_availability(True)
-
+            # Availability is already handled in _listen() (any byte ->
+            # _mark_session_alive); here we only fan out the state change.
             _LOGGER.info(
                 "State change for '%s': %s",
                 updated_zone,
@@ -446,8 +583,11 @@ class BoseCSPDevice:
 
     async def _send_command(self, command: str) -> None:
         """Send a raw command string to the device over the TCP socket."""
-        if not self.is_connected or not self._writer:
-            _LOGGER.warning("Not connected. Command not sent: %s", command)
+        # Guard on the writer only (not is_connected): connect() must be able
+        # to send the bootstrap queries that prove liveness before
+        # availability is set.
+        if not self._writer:
+            _LOGGER.warning("No active connection. Command not sent: %s", command)
             return
 
         _LOGGER.debug("Sending: %s", command)
