@@ -119,6 +119,7 @@ class BoseCSPDevice:
         self._ignore_volume_update: dict[str, bool] = {}
         self._ignore_mute_update: dict[str, bool] = {}
         self._ignore_source_update: dict[str, bool] = {}
+        self._ignore_av_update: dict[str, bool] = {}
 
         # Pre-compile regex patterns for response parsing.
         # The device echoes responses with optional whitespace, e.g.
@@ -132,6 +133,10 @@ class BoseCSPDevice:
         )
         self._source_re: re.Pattern[str] = re.compile(
             r'GA\s*"(.+?) Selector"\s*>1\s*=\s*(.*)'
+        )
+        # AutoVolume: 'GA "Zone AV">1=2' (On) / '=1' (Off).
+        self._av_re: re.Pattern[str] = re.compile(
+            r'GA\s*"(.+?) AV"\s*>1\s*=\s*(.*)'
         )
 
     # ------------------------------------------------------------------ #
@@ -544,6 +549,9 @@ class BoseCSPDevice:
                         if not self._ignore_source_update.get(zone):
                             await self.query_source(zone)
                         await asyncio.sleep(0.1)
+                        if not self._ignore_av_update.get(zone):
+                            await self.query_auto_volume(zone)
+                        await asyncio.sleep(0.1)
 
                 tick_count += 1
                 await asyncio.sleep(self._volume_interval)
@@ -610,6 +618,19 @@ class BoseCSPDevice:
                     new_source = int(value.strip())
                     if self._state[area].current_source != new_source:
                         self._state[area].current_source = new_source
+                        updated_zone = area
+            elif m := self._av_re.match(response):
+                area, value = m.groups()
+                if self._ignore_av_update.get(area):
+                    _LOGGER.debug(
+                        "Ignoring AutoVolume update for %s due to debounce", area
+                    )
+                    return
+                if area in self._state:
+                    # '2' = AutoVolume On, '1' = Off.
+                    new_av = value.strip() == "2"
+                    if self._state[area].auto_volume != new_av:
+                        self._state[area].auto_volume = new_av
                         updated_zone = area
 
         except Exception as err:  # noqa: BLE001
@@ -696,6 +717,18 @@ class BoseCSPDevice:
             zone_name: The zone to control.
             volume_db: The desired volume in dB.
         """
+        # The device rejects gain sets while AutoVolume is On, so don't send a
+        # doomed command or apply a phantom optimistic update. Re-fire the
+        # callback so any UI snaps back to the AutoVolume-driven level.
+        if self._state[zone_name].auto_volume:
+            _LOGGER.warning(
+                "Ignoring volume change for '%s': AutoVolume is On (the device "
+                "controls the level). Turn AutoVolume off to set volume.",
+                zone_name,
+            )
+            self._fire_update_callback(zone_name)
+            return
+
         # Only send if state is different
         if self._state[zone_name].volume == volume_db:
             return
@@ -753,6 +786,32 @@ class BoseCSPDevice:
         cmd = 'SA "%s Selector">1=%s' % (zone_name, source_index)
         await self._send_command(cmd)
 
+    async def set_auto_volume(self, zone_name: str, enabled: bool) -> None:
+        """Enable or disable AutoVolume for a zone.
+
+        Setting AutoVolume is only accepted by the device when the zone has been
+        AutoVolume-calibrated; otherwise the command is NAK'd and the next poll
+        re-syncs the real state.
+
+        Args:
+            zone_name: The zone to control.
+            enabled: True to turn AutoVolume On, False to turn it Off.
+        """
+        # Only send if state is different
+        if self._state[zone_name].auto_volume == enabled:
+            return
+
+        # Set ignore flag
+        self._spawn_ignore_flag(self._ignore_av_update, zone_name, 2.0)
+
+        # Optimistic update (before await to be synchronous)
+        self._state[zone_name].auto_volume = enabled
+        self._fire_update_callback(zone_name)
+
+        # '2' = AutoVolume On, '1' = Off.
+        cmd = 'SA "%s AV">1=%s' % (zone_name, "2" if enabled else "1")
+        await self._send_command(cmd)
+
     # ------------------------------------------------------------------ #
     #  Public query methods
     # ------------------------------------------------------------------ #
@@ -772,8 +831,13 @@ class BoseCSPDevice:
         cmd = 'GA "%s Selector">1' % zone_name
         await self._send_command(cmd)
 
+    async def query_auto_volume(self, zone_name: str) -> None:
+        """Query the current AutoVolume state for a zone."""
+        cmd = 'GA "%s AV">1' % zone_name
+        await self._send_command(cmd)
+
     async def query_all_zones_state(self) -> None:
-        """Query volume, mute, and source for all configured zones."""
+        """Query volume, mute, source, and AutoVolume for all zones."""
         _LOGGER.info("Querying all device states...")
         for zone in self._zones:
             await self.query_volume(zone)
@@ -781,4 +845,6 @@ class BoseCSPDevice:
             await self.query_mute(zone)
             await asyncio.sleep(0.1)
             await self.query_source(zone)
+            await asyncio.sleep(0.1)
+            await self.query_auto_volume(zone)
             await asyncio.sleep(0.1)
