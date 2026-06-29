@@ -38,15 +38,29 @@ HEALTH_RETRY_DELAY = 30
 # Attempts (initial + retries) before a cycle gives up and forces a reconnect.
 HEALTH_MAX_ATTEMPTS = 3
 
-# Health status values reported via the health callback.
+# Health status values reported via the health callback. These are stable
+# slugs (not display strings) so a consumer such as Home Assistant can map them
+# to translated, user-facing text.
 HEALTH_DISABLED = "disabled"
 HEALTH_STARTING = "starting"
 HEALTH_CHECKING = "checking"
 HEALTH_HEALTHY = "healthy"
-HEALTH_NO_ZONE = "not available - auto volume"
-HEALTH_SOCKET_NOT_CONNECTED = "Socket Not Connected"
+HEALTH_NO_ZONE = "no_free_zone"
+HEALTH_SOCKET_NOT_CONNECTED = "socket_not_connected"
 HEALTH_FAILING = "failing"
 HEALTH_CANT_RECONNECT = "cant_reconnect"
+
+# All health statuses, useful for consumers building an enum/options list.
+HEALTH_STATUSES = (
+    HEALTH_DISABLED,
+    HEALTH_STARTING,
+    HEALTH_CHECKING,
+    HEALTH_HEALTHY,
+    HEALTH_NO_ZONE,
+    HEALTH_SOCKET_NOT_CONNECTED,
+    HEALTH_FAILING,
+    HEALTH_CANT_RECONNECT,
+)
 
 
 class BoseCSPDevice:
