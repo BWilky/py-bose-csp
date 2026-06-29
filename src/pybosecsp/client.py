@@ -25,6 +25,29 @@ from .models import ZoneState
 
 _LOGGER = logging.getLogger(__name__)
 
+# --- Active "Health Checking" probe tuning -------------------------------- #
+# The minimum gain step the CSP accepts (0.5 dB per the Serial Control Protocol
+# Guide); the probe nudges by exactly one step so the change is inaudible.
+MICRO_STEP_DB = 0.5
+# Seconds between health-check cycles.
+HEALTH_INTERVAL = 1800
+# Seconds to wait after the nudge before reading the value back.
+HEALTH_WAIT = 10
+# Seconds to wait between failed attempts within a cycle.
+HEALTH_RETRY_DELAY = 30
+# Attempts (initial + retries) before a cycle gives up and forces a reconnect.
+HEALTH_MAX_ATTEMPTS = 3
+
+# Health status values reported via the health callback.
+HEALTH_DISABLED = "disabled"
+HEALTH_STARTING = "starting"
+HEALTH_CHECKING = "checking"
+HEALTH_HEALTHY = "healthy"
+HEALTH_NO_ZONE = "not available - auto volume"
+HEALTH_SOCKET_NOT_CONNECTED = "Socket Not Connected"
+HEALTH_FAILING = "failing"
+HEALTH_CANT_RECONNECT = "cant_reconnect"
+
 
 class BoseCSPDevice:
     """Asyncio client for Bose CSP devices.
@@ -43,6 +66,8 @@ class BoseCSPDevice:
         reconnect_delay: int = 5,
         volume_interval: int = 5,
         other_interval: int = 30,
+        health_check_enabled: bool = True,
+        zone_limits: dict[str, tuple[float, float]] | None = None,
     ) -> None:
         """Initialize the BoseCSPDevice.
 
@@ -53,10 +78,17 @@ class BoseCSPDevice:
             reconnect_delay: Seconds to wait between reconnection attempts.
             volume_interval: Seconds between volume polling cycles.
             other_interval: Seconds between mute/source polling cycles.
+            health_check_enabled: Whether to run the active control-verify
+                "Health Checking" probe.
+            zone_limits: Optional {zone: (min_db, max_db)} map used to keep the
+                health-check nudge within each zone's floor/ceiling.
         """
         self.host: str = host
         self.port: int = port
         self._zones: list[str] = list(zones)
+        self._zone_limits: dict[str, tuple[float, float]] = dict(
+            zone_limits or {}
+        )
         self._reconnect_delay: int = reconnect_delay
         # Cap on the exponential reconnect backoff. Kept modest so that once the
         # device frees the SoIP port (e.g. the web dashboard is closed) the
@@ -115,11 +147,31 @@ class BoseCSPDevice:
         # Availability callbacks (global)
         self._availability_callbacks: list[Callable[[bool], None]] = []
 
+        # Health-status callbacks (global). Carry one of the HEALTH_* strings.
+        self._health_callbacks: list[Callable[[str], None]] = []
+        self._health_status: str = HEALTH_DISABLED
+
         # Dictionaries to hold ignore flags for optimistic updates
         self._ignore_volume_update: dict[str, bool] = {}
         self._ignore_mute_update: dict[str, bool] = {}
         self._ignore_source_update: dict[str, bool] = {}
         self._ignore_av_update: dict[str, bool] = {}
+
+        # --- Active "Health Checking" probe state --------------------------- #
+        self._health_check_enabled: bool = health_check_enabled
+        self._health_task: asyncio.Task | None = None
+        # Chosen probe zone, in-memory only (never persisted): re-derived on
+        # every (re)connect so it stays in sync with current AutoVolume state.
+        self._health_zone: str | None = None
+        # When a probe is in flight, gain readbacks for this zone are routed to
+        # _probe_value/_probe_event instead of public state (see
+        # _parse_response), so the probe never fires a state-change callback.
+        self._probe_zone: str | None = None
+        self._probe_value: float | None = None
+        self._probe_event: asyncio.Event = asyncio.Event()
+        # Set if a user-originated set_volume() hits the probe zone mid-window,
+        # so a deliberate change is classified inconclusive rather than failed.
+        self._health_user_change: bool = False
 
         # Pre-compile regex patterns for response parsing.
         # The device echoes responses with optional whitespace, e.g.
@@ -196,6 +248,30 @@ class BoseCSPDevice:
         if callback in self._availability_callbacks:
             self._availability_callbacks.remove(callback)
 
+    def subscribe_health(self, callback: Callable[[str], None]) -> None:
+        """Register a callback for health-status notifications.
+
+        The callback receives one of the module-level ``HEALTH_*`` strings.
+        Called immediately with the current status on subscribe.
+        """
+        self._health_callbacks.append(callback)
+        callback(self._health_status)
+
+    def unsubscribe_health(self, callback: Callable[[str], None]) -> None:
+        """Unregister a previously registered health-status callback."""
+        if callback in self._health_callbacks:
+            self._health_callbacks.remove(callback)
+
+    @property
+    def health_status(self) -> str:
+        """Return the current health-check status string."""
+        return self._health_status
+
+    @property
+    def health_zone(self) -> str | None:
+        """Return the zone currently used for the health-check probe."""
+        return self._health_zone
+
     # ------------------------------------------------------------------ #
     #  Connection lifecycle
     # ------------------------------------------------------------------ #
@@ -209,6 +285,33 @@ class BoseCSPDevice:
         self.is_connected = is_available
         for callback in self._availability_callbacks:
             callback(is_available)
+
+        # Health status follows the connection edge: the probe only runs on a
+        # healthy socket, so when the socket is down the sensor reports that
+        # rather than a stale probe result.
+        if self._health_check_enabled:
+            if not is_available:
+                # Don't downgrade a terminal "can't reconnect" to the milder
+                # transient state.
+                if self._health_status != HEALTH_CANT_RECONNECT:
+                    self._notify_health(HEALTH_SOCKET_NOT_CONNECTED)
+            elif self._health_zone is not None and self._health_status in (
+                HEALTH_SOCKET_NOT_CONNECTED,
+                HEALTH_CANT_RECONNECT,
+                HEALTH_DISABLED,
+            ):
+                # Reconnected: hand back to the probe (it will confirm healthy).
+                self._notify_health(HEALTH_STARTING)
+
+    def _notify_health(self, status: str) -> None:
+        """Notify all registered listeners of a health-status change."""
+        if self._health_status == status:
+            return  # No change
+
+        _LOGGER.info("Health check status: %s", status)
+        self._health_status = status
+        for callback in self._health_callbacks:
+            callback(status)
 
     def _mark_session_alive(self) -> None:
         """Record proof that the control session is live.
@@ -287,6 +390,15 @@ class BoseCSPDevice:
 
             self._listener_task = asyncio.create_task(self._listen())
             self._query_task = asyncio.create_task(self._periodic_query())
+
+            # The health-check loop self-guards on connection state, so it is
+            # started once and kept alive across reconnects (its 30-minute timer
+            # is not reset by transient drops). _cleanup_connection deliberately
+            # leaves it running; disconnect() tears it down.
+            if self._health_check_enabled and (
+                self._health_task is None or self._health_task.done()
+            ):
+                self._health_task = asyncio.create_task(self._health_check_loop())
 
             _LOGGER.info(
                 "TCP connection to %s:%s established; verifying control "
@@ -368,6 +480,16 @@ class BoseCSPDevice:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._reconnect_task = None
+
+        # Stop the health-check loop (kept alive across reconnects, so it is
+        # torn down here at full shutdown rather than in _cleanup_connection).
+        if self._health_task:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._health_task = None
 
         # Cancel any pending optimistic ignore-flag timers.
         for task in list(self._background_tasks):
@@ -459,6 +581,14 @@ class BoseCSPDevice:
             except asyncio.CancelledError:
                 return  # Shutdown in progress, don't retry.
             except Exception:  # noqa: BLE001
+                # Sustained failures escalate the health status from the milder
+                # "Socket Not Connected" to the terminal "cant_reconnect".
+                # _mark_session_alive() resets this once a byte arrives again.
+                if (
+                    self._health_check_enabled
+                    and self._reconnect_attempts >= HEALTH_MAX_ATTEMPTS
+                ):
+                    self._notify_health(HEALTH_CANT_RECONNECT)
                 # Swallow and loop so the retry never dies; the next pass waits
                 # a longer backoff and tries again.
                 continue
@@ -565,6 +695,186 @@ class BoseCSPDevice:
                 await asyncio.sleep(self._volume_interval)
 
     # ------------------------------------------------------------------ #
+    #  Active "Health Checking" probe
+    # ------------------------------------------------------------------ #
+    #
+    # Verifies the control session can actually *mutate* state (not merely
+    # answer reads). One sticky, in-memory zone (never persisted) is nudged by
+    # the 0.5 dB minimum step, then read back and restored, entirely off the
+    # public state/event path. Failures hand off to the existing reconnect
+    # machinery; status is published via the health callback.
+
+    def _select_health_zone(self) -> str | None:
+        """Pick (and remember) a zone usable for the probe.
+
+        Returns the first zone whose AutoVolume is Off and which has at least
+        one micro-step of headroom, or None if none qualifies. The choice lives
+        only on this instance and is re-derived on every (re)connect.
+        """
+        for zone in self._zones:
+            if self._state[zone].auto_volume:
+                continue
+            limits = self._zone_limits.get(zone)
+            if limits and (limits[1] - limits[0]) < MICRO_STEP_DB:
+                continue
+            self._health_zone = zone
+            return zone
+        self._health_zone = None
+        return None
+
+    def _ensure_health_zone(self) -> bool:
+        """Confirm the chosen zone is still usable, re-selecting if not.
+
+        Returns False (and logs) when no non-AutoVolume zone remains.
+        """
+        zone = self._health_zone
+        if zone is not None and not self._state[zone].auto_volume:
+            return True
+        if zone is not None:
+            _LOGGER.warning(
+                "Health-check zone '%s' is now AutoVolume-On; re-selecting.",
+                zone,
+            )
+        if self._select_health_zone() is None:
+            _LOGGER.error(
+                "No non-AutoVolume zone available for health checking; "
+                "stopping the probe."
+            )
+            return False
+        return True
+
+    def _nudge_target(self, zone: str, current: float) -> float:
+        """Compute the micro-adjusted target, respecting floor/ceiling."""
+        up = round(current + MICRO_STEP_DB, 1)
+        down = round(current - MICRO_STEP_DB, 1)
+        limits = self._zone_limits.get(zone)
+        if limits:
+            floor, ceiling = limits
+            if up > ceiling:
+                return down
+            if down < floor:
+                return up
+        return up
+
+    async def _run_single_check(self) -> str:
+        """Run one nudge/readback/restore probe.
+
+        Returns "pass", "fail", or "inconclusive" (a user/external change during
+        the window — value left untouched, never counted as a failure).
+        """
+        zone = self._health_zone
+        original = self._state[zone].volume
+        target = self._nudge_target(zone, original)
+
+        self._probe_zone = zone
+        self._health_user_change = False
+        self._probe_value = None
+        result = "inconclusive"
+        try:
+            # Nudge behind the scenes (no optimistic update, no callback).
+            await self._send_command('SA "%s Gain">1=%.1f' % (zone, target))
+            await asyncio.sleep(HEALTH_WAIT)
+
+            # Only judge a result on a still-healthy socket; otherwise the
+            # connection layer owns the status and this is inconclusive.
+            if not self.is_connected:
+                return "inconclusive"
+
+            self._probe_event.clear()
+            self._probe_value = None
+            await self.query_volume(zone)
+            try:
+                await asyncio.wait_for(self._probe_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
+            value = self._probe_value
+            if self._health_user_change or (
+                value is not None and value != target and value != original
+            ):
+                result = "inconclusive"
+            elif value == target:
+                result = "pass"
+            else:
+                result = "fail"  # value == original, or no readback
+            return result
+        finally:
+            self._probe_zone = None
+            # Always restore for pass/fail so the level never drifts; never
+            # clobber a deliberate user/external change (inconclusive).
+            if result in ("pass", "fail") and self.is_connected:
+                await self._send_command(
+                    'SA "%s Gain">1=%.1f' % (zone, original)
+                )
+
+    async def _run_health_cycle(self) -> None:
+        """Run one cycle: up to HEALTH_MAX_ATTEMPTS, else force a reconnect."""
+        self._notify_health(HEALTH_CHECKING)
+        for attempt in range(1, HEALTH_MAX_ATTEMPTS + 1):
+            if not self.is_connected:
+                return  # Socket dropped mid-cycle; connection layer owns status.
+            result = await self._run_single_check()
+            if result == "pass":
+                self._notify_health(HEALTH_HEALTHY)
+                return
+            if result == "inconclusive":
+                # A user/external change; can't verify this cycle, try next time.
+                _LOGGER.debug(
+                    "Health check inconclusive (volume changed during window); "
+                    "rescheduling."
+                )
+                return
+            _LOGGER.warning(
+                "Health check attempt %d/%d failed for zone '%s'.",
+                attempt,
+                HEALTH_MAX_ATTEMPTS,
+                self._health_zone,
+            )
+            self._notify_health(HEALTH_FAILING)
+            if attempt < HEALTH_MAX_ATTEMPTS:
+                await asyncio.sleep(HEALTH_RETRY_DELAY)
+
+        _LOGGER.error(
+            "Health check failed %d times; control session unverified, "
+            "forcing reconnect.",
+            HEALTH_MAX_ATTEMPTS,
+        )
+        self._start_reconnect()
+
+    async def _health_check_loop(self) -> None:
+        """Periodic probe loop. Started on connect; survives reconnects."""
+        if not self._health_check_enabled:
+            return
+        # Let the bootstrap poll populate AutoVolume state before choosing.
+        await asyncio.sleep(5)
+        if self._select_health_zone() is None:
+            self._notify_health(HEALTH_NO_ZONE)
+            return
+        if self._health_status not in (
+            HEALTH_SOCKET_NOT_CONNECTED,
+            HEALTH_CANT_RECONNECT,
+        ):
+            self._notify_health(HEALTH_STARTING)
+
+        while self._running:
+            try:
+                await asyncio.sleep(HEALTH_INTERVAL)
+                if not self._running:
+                    return
+                # Only probe an assumed-healthy connection.
+                if not self.is_connected:
+                    continue
+                if not self._ensure_health_zone():
+                    self._notify_health(HEALTH_NO_ZONE)
+                    return  # No usable zone; stop running.
+                await self._run_health_cycle()
+            except asyncio.CancelledError:
+                return
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Error in health check loop: %s", err)
+                await asyncio.sleep(HEALTH_RETRY_DELAY)
+
+    # ------------------------------------------------------------------ #
     #  Response parsing
     # ------------------------------------------------------------------ #
 
@@ -582,6 +892,17 @@ class BoseCSPDevice:
         try:
             if m := self._gain_re.match(response):
                 area, value = m.groups()
+                # Health-check probe interception: while a probe is in flight
+                # for this zone, route the gain readback to the probe channel
+                # and do NOT touch public state or fire callbacks, so the probe
+                # is invisible to Home Assistant.
+                if area == self._probe_zone:
+                    try:
+                        self._probe_value = float(value.strip())
+                    except ValueError:
+                        self._probe_value = None
+                    self._probe_event.set()
+                    return
                 # Check ignore flag
                 if self._ignore_volume_update.get(area):
                     _LOGGER.debug(
@@ -728,6 +1049,12 @@ class BoseCSPDevice:
             )
             self._fire_update_callback(zone_name)
             return
+
+        # If a health-check probe is mid-window on this zone, a user-originated
+        # change must not be read back as a failed probe; flag it so the probe
+        # classifies the cycle as inconclusive and leaves the user's value.
+        if zone_name == self._probe_zone:
+            self._health_user_change = True
 
         # Only send if state is different
         if self._state[zone_name].volume == volume_db:
