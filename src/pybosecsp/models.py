@@ -1,4 +1,4 @@
-"""Data models for the bose-csp-api library."""
+"""Data models for the py-bose-csp library."""
 
 from dataclasses import dataclass
 

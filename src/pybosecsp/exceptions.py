@@ -1,4 +1,4 @@
-"""Exceptions for the bose-csp-api library."""
+"""Exceptions for the py-bose-csp library."""
 
 
 class BoseCSPError(Exception):

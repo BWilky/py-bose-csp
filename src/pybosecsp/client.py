@@ -25,6 +25,10 @@ from .models import ZoneState
 
 _LOGGER = logging.getLogger(__name__)
 
+# Pause between consecutive commands written to the device. The CSP's SoIP
+# parser can drop commands sent back-to-back, so queries/sets are spaced out.
+INTER_COMMAND_DELAY = 0.1
+
 # --- Active "Health Checking" probe tuning -------------------------------- #
 # The minimum gain step the CSP accepts (0.5 dB per the Serial Control Protocol
 # Guide); the probe nudges by exactly one step so the change is inaudible.
@@ -141,13 +145,13 @@ class BoseCSPDevice:
         self._connect_verify_timeout: float = 10.0
 
         self._running: bool = False
-        self._listener_task: asyncio.Task | None = None
-        self._query_task: asyncio.Task | None = None
-        self._reconnect_task: asyncio.Task | None = None
+        self._listener_task: asyncio.Task[None] | None = None
+        self._query_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
 
         # Strong references to fire-and-forget tasks (e.g. ignore-flag
         # timers) so they are not garbage-collected before completion.
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
         # Consecutive failed reconnect attempts, used for exponential
         # backoff so a device that keeps dropping/refusing us (e.g. its web
@@ -173,7 +177,7 @@ class BoseCSPDevice:
 
         # --- Active "Health Checking" probe state --------------------------- #
         self._health_check_enabled: bool = health_check_enabled
-        self._health_task: asyncio.Task | None = None
+        self._health_task: asyncio.Task[None] | None = None
         # Chosen probe zone, in-memory only (never persisted): re-derived on
         # every (re)connect so it stays in sync with current AutoVolume state.
         self._health_zone: str | None = None
@@ -683,19 +687,19 @@ class BoseCSPDevice:
                     # Only query if we are not ignoring updates for this zone
                     if not self._ignore_volume_update.get(zone):
                         await self.query_volume(zone)
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(INTER_COMMAND_DELAY)
 
                 if tick_count % ticks_per_other_query == 0:
                     for zone in self._zones:
                         if not self._ignore_mute_update.get(zone):
                             await self.query_mute(zone)
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(INTER_COMMAND_DELAY)
                         if not self._ignore_source_update.get(zone):
                             await self.query_source(zone)
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(INTER_COMMAND_DELAY)
                         if not self._ignore_av_update.get(zone):
                             await self.query_auto_volume(zone)
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(INTER_COMMAND_DELAY)
 
                 tick_count += 1
                 await asyncio.sleep(self._volume_interval)
@@ -776,7 +780,10 @@ class BoseCSPDevice:
         Returns "pass", "fail", or "inconclusive" (a user/external change during
         the window — value left untouched, never counted as a failure).
         """
+        # Callers (_run_health_cycle) gate this on _ensure_health_zone(), which
+        # guarantees a usable zone; assert to make that invariant explicit.
         zone = self._health_zone
+        assert zone is not None
         original = self._state[zone].volume
         target = self._nudge_target(zone, original)
 
@@ -979,8 +986,7 @@ class BoseCSPDevice:
                 updated_zone,
                 self._state[updated_zone],
             )
-            for callback in self._update_callbacks:
-                callback(updated_zone)
+            self._fire_update_callback(updated_zone)
 
     # ------------------------------------------------------------------ #
     #  Command sending
@@ -1009,8 +1015,12 @@ class BoseCSPDevice:
     # ------------------------------------------------------------------ #
 
     def _fire_update_callback(self, zone_name: str) -> None:
-        """Manually fire the update callback for a zone."""
-        _LOGGER.debug("Firing optimistic update for %s", zone_name)
+        """Fan out a state-change notification for a zone to all subscribers.
+
+        Used by both the optimistic set_* path and the polled-response path in
+        _parse_response.
+        """
+        _LOGGER.debug("Firing update callback for %s", zone_name)
         for callback in self._update_callbacks:
             callback(zone_name)
 
@@ -1182,10 +1192,10 @@ class BoseCSPDevice:
         _LOGGER.info("Querying all device states...")
         for zone in self._zones:
             await self.query_volume(zone)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(INTER_COMMAND_DELAY)
             await self.query_mute(zone)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(INTER_COMMAND_DELAY)
             await self.query_source(zone)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(INTER_COMMAND_DELAY)
             await self.query_auto_volume(zone)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(INTER_COMMAND_DELAY)
